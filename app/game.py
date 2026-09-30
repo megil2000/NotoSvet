@@ -23,7 +23,8 @@ from .display import Display
 from .editor import EditorModel
 from .editor_view import EditorScreen, Reference
 from .import_view import FragmentScreen, LibraryScreen
-from .config import BLACK_PCS, COLORS, HIGH, LOW, NOTE_LABEL, NOTE_NAMES, SCAN_TO_NOTE, note_color, note_name
+from .config import HIGH, LOW, NOTE_LABEL, SCAN_TO_NOTE, note_color, note_name
+from .menu_view import draw_menu
 from .icon import make_icon
 from .lesson import Lesson, load_lessons
 from .midi_io import MidiLink
@@ -237,6 +238,11 @@ class App:
                 self.mouse_note = pitch
                 if pitch is not None:
                     self.note_down(pitch)
+        elif e.type == pygame.MOUSEMOTION and self.state == "menu":
+            for i, (rect, _) in enumerate(self.zones):
+                if rect.collidepoint(e.pos):
+                    self.menu_i = i
+                    break
         elif e.type == pygame.WINDOWFOCUSLOST:
             for p in list(self.held):  # иначе клавиши «залипнут»
                 self.note_up(p)
@@ -248,9 +254,9 @@ class App:
         enter = key in (pygame.K_RETURN, pygame.K_KP_ENTER)
         if self.state == "menu":
             items = self.menu_items()
-            if key == pygame.K_UP:
+            if key in (pygame.K_UP, pygame.K_LEFT):
                 self.menu_i = (self.menu_i - 1) % len(items)
-            elif key == pygame.K_DOWN:
+            elif key in (pygame.K_DOWN, pygame.K_RIGHT):
                 self.menu_i = (self.menu_i + 1) % len(items)
             elif enter:
                 items[self.menu_i][1]()
@@ -578,25 +584,7 @@ class App:
         self.fragment.draw()
 
     def draw_menu(self) -> None:
-        s, cx = self.screen, D.W // 2
-        D.text(s, "НотоСвет", 56, D.TEXT, bold=True, midtop=(cx, 22))
-        D.text(s, "Программа для обучающего пианино. Пока пианино не собрано, "
-                  "играйте на клавиатуре компьютера.", 16, D.MUTED, midtop=(cx, 92))
-        for i, (label, action) in enumerate(self.menu_items()):
-            r = pygame.Rect(0, 0, 340, 42)
-            r.midtop = (cx, 126 + i * 50)
-            self.button(r, label, i == self.menu_i, action)
-        D.text(s, "Цвет — это нота", 14, D.MUTED, midtop=(cx, 390))
-        chip = 78
-        for i in range(12):
-            r = pygame.Rect(cx - chip * 6 + i * chip + 8, 414, chip - 16, 10)
-            D.rect(s, COLORS[i], r, border_radius=5)
-            D.text(s, NOTE_NAMES[i], 14, D.MUTED if i in BLACK_PCS else D.TEXT, midtop=(r.centerx, 430))
-        D.text(s, "Нижний ряд Z…M — малая октава (C3–B3)  ·  верхний ряд Q…I — первая октава и «до» второй "
-                  "(C4–C5)  ·  Пробел — педаль", 14, D.DIM, midtop=(cx, 466))
-        D.text(s, "Свои мелодии — «Создать мелодию» или перетащите .mid/.json в окно  ·  "
-                  "F11 или Ctrl/Cmd+F — полный экран", 14, D.DIM, midtop=(cx, 488))
-        D.text(s, self.midi.label, 13, D.DIM, topright=(D.W - 20, 16))
+        draw_menu(self)
 
     def draw_setup(self) -> None:
         s = self.screen
