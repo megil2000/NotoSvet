@@ -1,8 +1,11 @@
 .venv/
+.venv-ai/
+.model-cache/
 __pycache__/
 .pytest_cache/
 build/
 dist/
+dist-old/
 records.json
 .DS_Store
 settings.json

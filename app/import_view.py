@@ -1,4 +1,4 @@
-"""Мелодия из своей песни: библиотека → фрагмент на волне → распознавание → редактор.
+"""Мелодия из своей песни: библиотека → фрагмент на волне → распознавание → дорожки → редактор.
 
 Долгие дела (поиск песен, чтение файла, распознавание) идут в отдельном потоке —
 окно не зависает, а распознавание можно отменить.
@@ -12,20 +12,26 @@ import numpy as np
 import pygame
 
 from . import draw as D
-from . import library
+from . import library, neural
 from .audio import Audio, AudioError, load
-from .editor import GRIDS, EditorModel, ENote
-from .editor_view import WAVE, Reference
-from .transcribe import Cancelled, transcribe
+from .editor import GRIDS
+from .editor_view import WAVE
+from .transcribe import Cancelled
 
 ROW_H = 46
 LIST_TOP, LIST_BOTTOM = 136, D.HIT_Y - 12
 WAVE_RECT = pygame.Rect(60, 128, 1160, 170)
 DEFAULT_LEN = 40.0      # сек: столько берём по умолчанию — примерно куплет или припев
 MIN_LEN = 3.0
-TIPS = ["Лучше всего распознаётся чёткая мелодия — голос или соло-инструмент.",
-        "Выделите на волне кусок, где мелодию слышно яснее всего, например припев.",
-        "Потом ноты можно поправить в редакторе и послушать вместе с оригиналом."]
+TIPS = {
+    "neural": ["Нейросеть разделит песню на дорожки: вокал, гитару, пианино, бас, барабаны.",
+               "Потом выберите дорожку, как в Songsterr, — остальные зазвучат вместе с вами.",
+               "40 секунд песни — около полуминуты работы; можно выделить и всю песню."],
+    "classic": ["Лучше всего распознаётся чёткая мелодия — голос или соло-инструмент.",
+                "Выделите на волне кусок, где мелодию слышно яснее всего, например припев.",
+                "Потом ноты можно поправить в редакторе и послушать вместе с оригиналом."],
+}
+ENGINE_LABEL = {"neural": "Нейросеть: дорожки инструментов", "classic": "Без нейросети: только мелодия"}
 
 
 def fmt(sec: float) -> str:
@@ -141,8 +147,9 @@ class LibraryScreen:
         D.text(s, "‹ Назад", 15, D.MUTED, center=(60, 30))
         self.app.zones.append((pygame.Rect(16, 12, 88, 36), self.app.close_library))
         D.text(s, "Мелодия из песни", 24, D.TEXT, bold=True, midleft=(124, 30))
-        D.text(s, "Программа найдёт мелодию, темп и сетку — ноты откроются в редакторе", 14, D.MUTED,
-               midleft=(360, 31))
+        D.text(s, "Нейросеть разделит песню на дорожки и найдёт ноты — выберите, какую играть"
+               if neural.available() else "Программа найдёт мелодию, темп и сетку — ноты откроются в редакторе",
+               14, D.MUTED, midleft=(360, 31))
 
         box = pygame.Rect(60, 70, 760, 44)
         D.rect(s, D.PANEL_HI, box, border_radius=10)
@@ -202,6 +209,7 @@ class FragmentScreen:
         self.sel = [0.0, 0.0]
         self.anchor: float | None = None
         self.grid_i = 1
+        self.engine = "neural" if neural.available() else "classic"
         self.stage, self.frac = "Открываю песню", 0.0
         self.cancel = threading.Event()
         self.result = None
@@ -228,13 +236,17 @@ class FragmentScreen:
         self.sel = [0.0, a.duration] if a.duration <= 60 else [start, min(a.duration, start + DEFAULT_LEN)]
         self.phase = "ready"
 
-    def _analyze(self, start: float, end: float, grid: float) -> None:
+    def _analyze(self, start: float, end: float, grid: float, engine: str) -> None:
         def progress(stage, frac):
             self.stage, self.frac = stage, frac
         try:
-            self.result = (start, transcribe(self.audio.mono_segment(start, end), grid, progress, self.cancel))
+            self.result = (start, neural.recognize(self.audio, start, end, grid, engine, progress, self.cancel))
         except Cancelled:
             self.phase = "ready"
+        except ValueError as e:
+            self.error, self.phase = str(e), "error"
+        except OSError as e:  # нет интернета, когда нейросеть скачивается в первый раз
+            self.error, self.phase = f"не удалось скачать нейросеть ({e}) — проверьте интернет", "error"
         except Exception as e:  # noqa: BLE001 — поток не должен умирать молча, иначе экран «зависнет»
             self.error, self.phase = f"не удалось распознать ({type(e).__name__}: {e})", "error"
 
@@ -249,9 +261,18 @@ class FragmentScreen:
             return
         self.stop_preview()
         self.cancel.clear()
-        self.phase, self.stage, self.frac = "analyzing", "Спектр", 0.0
+        self.phase, self.frac = "analyzing", 0.0
+        self.stage = "Загружаю нейросети" if self.engine == "neural" else "Спектр"
         a, b = self.sel
-        threading.Thread(target=self._analyze, args=(a, b, GRIDS[self.grid_i][0]), daemon=True).start()
+        threading.Thread(target=self._analyze, args=(a, b, GRIDS[self.grid_i][0], self.engine), daemon=True).start()
+
+    def toggle_engine(self) -> None:
+        if not neural.available():
+            self.app.notify("Нейросеть не установлена: pip install -r requirements-ai.txt (подробнее — в README)",
+                            error=True)
+            return
+        if self.editable:
+            self.engine = "classic" if self.engine == "neural" else "neural"
 
     def toggle_preview(self) -> None:
         if self.preview is not None:
@@ -326,18 +347,19 @@ class FragmentScreen:
         if self.preview is not None and (self.channel is None or not self.channel.get_busy()):
             self.preview = self.channel = None
         if self.result is not None:
-            start, r = self.result
+            start, rec = self.result
             self.result = None
             self.phase = "ready"
-            if not r.notes:
-                self.error, self.phase = ("мелодию не удалось найти — выделите кусок, где лучше слышен голос "
-                                          "или ведущий инструмент"), "error"
+            if not any(t.playable for t in rec.tracks):
+                self.error, self.phase = (("нейросеть не нашла нот — выделите кусок, где инструменты слышно яснее"
+                                           if rec.neural else "мелодию не удалось найти — выделите кусок, где лучше "
+                                           "слышен голос или ведущий инструмент"), "error")
                 return
-            model = EditorModel(self.audio.title, r.bpm, [ENote(t, d, p, "R") for t, d, p in r.notes])
-            model.grid_i = self.grid_i
-            model.dirty = True
-            self.close()
-            self.app.finish_import(model, Reference(self.audio, start + r.first_beat), r)
+            if rec.neural:  # дорожки — выбрать, какую играть; фрагмент остаётся, чтобы вернуться
+                self.app.open_tracks(rec, self.audio, start)
+            else:
+                self.close()
+                self.app.finish_import(rec, self.audio, start, rec.best())
 
     # --- кадр ---
 
@@ -373,9 +395,10 @@ class FragmentScreen:
                    topleft=(60, bar.bottom + 12))
             return
         if self.phase == "error":
-            D.text(s, self.error, 15, (255, 120, 120), topleft=(60, y + 60))
+            for i, line in enumerate(D.wrap(self.error, 15, 720)[:3]):
+                D.text(s, line, 15, (255, 120, 120), topleft=(60, y + 60 + i * 22))
         else:
-            for i, tip in enumerate(TIPS):
+            for i, tip in enumerate(TIPS[self.engine]):
                 D.text(s, tip, 14, D.MUTED, topleft=(60, y + 64 + i * 22))
 
         x = 820
@@ -389,8 +412,14 @@ class FragmentScreen:
         self.app.zones.append((grid, lambda: setattr(self, "grid_i", 1 if self.grid_i == 2 else 2)))
         go = pygame.Rect(x, y + 56, 400, 52)
         D.rect(s, D.TEXT, go, border_radius=10)
-        D.text(s, "Распознать мелодию — Enter", 18, D.DARK_TEXT, bold=True, center=go.center)
+        D.text(s, "Разделить на дорожки — Enter" if self.engine == "neural" else "Распознать мелодию — Enter",
+               18, D.DARK_TEXT, bold=True, center=go.center)
         self.app.zones.append((go, self.recognize))
+        engine = pygame.Rect(x, y + 118, 400, 36)
+        D.rect(s, D.PANEL, engine, border_radius=10)
+        label = ENGINE_LABEL[self.engine] if neural.available() else "Нейросеть не установлена — только мелодия"
+        D.text(s, label, 14, D.TEXT if neural.available() else D.DIM, center=engine.center)
+        self.app.zones.append((engine, self.toggle_engine))
 
     def draw_wave(self, s) -> None:
         r, a = WAVE_RECT, self.audio

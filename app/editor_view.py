@@ -5,21 +5,29 @@
 сквозь него. Время идёт снизу вверх, как ноты в игре, поэтому каждая нота стоит точно
 над своей клавишей. Если мелодия распознана из песни, слева видна волна песни (синяя,
 как в rekordbox), а «Оригинал» играет песню в такт с нотами.
+
+Если песню разделила нейросеть, под панелью — дорожки, как в Songsterr: вкладка на каждый
+инструмент со своими нотами. «Звук» играет вместе с нотами всю песню, минус дорожки
+(остальные инструменты — вы играете за этот) или только её; волна слева — эта дорожка.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import pygame
 
 from . import draw as D
 from .audio import Audio
 from .config import HIGH, LOW, NOTE_LABEL, note_color
 from .editor import BEATS_PER_BAR, EPS, FREE_STEP, GRIDS, HAND_MODES, LENGTHS, EditorModel
+from .neural import Track
+from .tracks_view import COLORS, draw_icon
 
 TOOL_H = 96
-AREA_TOP, AREA_BOTTOM = TOOL_H, D.HIT_Y
+TRACKS_H = 40                             # строка дорожек песни
+AREA_BOTTOM = D.HIT_Y
 PLAY_Y = D.HIT_Y - 72                     # курсор: ниже — прошлое, выше — то, что прозвучит
 GRID_X1 = round(D.X0 + (HIGH - LOW + 1) * D.SLOT)
 ZOOMS = (24, 32, 44, 60, 80, 110, 150)    # пикселей на долю
@@ -31,6 +39,8 @@ REC = (235, 64, 64)
 CTRL = pygame.KMOD_CTRL | pygame.KMOD_META
 WAVE = (46, 118, 214)                     # волна песни — синяя, как в rekordbox
 ORIGINAL_VOLUME = 0.7
+SOUND = {"song": "Песня", "minus": "Минус", "solo": "Дорожка", "off": "Выкл"}
+DIGITS = [getattr(pygame, f"KSCAN_{k}") for k in range(1, 10)]   # Ctrl/Cmd + цифра — дорожка
 
 HELP = [
     ("Мышь", ""),
@@ -52,8 +62,9 @@ HELP = [
     ("Backspace", "удалить выбранные; при вводе по шагам — шаг назад"),
     ("[ ]   − =", "темп   масштаб"),
     ("×2  ÷2", "темп вдвое быстрее / медленнее — ноты звучат так же, меняется запись"),
-    ("Из песни", "ноты из своей песни: программа найдёт мелодию, темп и сетку"),
+    ("Из песни", "ноты из своей песни: нейросеть разделит её на дорожки и найдёт ноты"),
     ("Оригинал", "песня играет вместе с нотами — удобно проверять распознанное"),
+    ("Дорожки, Ctrl/Cmd + 1…6", "инструменты песни; «Звук»: вся песня, минус дорожки или только она"),
     ("Ctrl/Cmd + Z, Shift + Z, S, A", "отменить, вернуть, сохранить, выбрать все"),
     ("Esc", "выйти из редактора"),
 ]
@@ -61,21 +72,63 @@ HELP = [
 
 @dataclass
 class Reference:
-    """Песня, из которой распознана мелодия: доля 0 звучит на секунде start."""
+    """Песня, из которой распознана мелодия: доля 0 звучит на секунде start.
+
+    track — выбранная дорожка, если песню разделила нейросеть; её звук начинается
+    с сэмпла offset песни (начало фрагмента).
+    """
     audio: Audio
+    start: float
+    track: Track | None = None
+    offset: int = 0
+
+    def sound(self, mode: str, start: float, end: float) -> np.ndarray:
+        """Звук на отрезке песни: song — вся песня, minus — без дорожки, solo — только дорожка."""
+        song = self.audio.segment(start, end)
+        if mode == "song" or self.track is None or self.track.pcm is None:
+            return song
+        stem, pcm = np.zeros_like(song), self.track.pcm
+        a = int(start * self.audio.rate) - self.offset  # сэмпл дорожки под первым сэмплом song
+        lo, hi = max(0, -a), min(len(song), len(pcm) - a)
+        if hi > lo:
+            stem[lo:hi] = pcm[a + lo:a + hi]
+        if mode == "solo":
+            return stem
+        return np.clip(song.astype(np.int32) - stem, -32768, 32767).astype(np.int16)
+
+    def envelope(self) -> tuple[np.ndarray, float]:
+        """Громкость по 10 мс для волны и секунда песни, с которой она идёт."""
+        if self.track is not None and self.track.env is not None:
+            return self.track.env, self.offset / self.audio.rate
+        return self.audio.env, 0.0
+
+
+@dataclass
+class Part:
+    """Дорожка песни в редакторе: свои ноты и своя отмена; доля 0 — на секунде start песни."""
+    track: Track
+    model: EditorModel
     start: float
 
 
 class EditorScreen:
-    def __init__(self, app, model: EditorModel, back: str, reference: Reference | None = None):
+    def __init__(self, app, model: EditorModel, back: str, reference: Reference | None = None,
+                 parts: list[Part] | None = None, part: int = 0):
         self.app, self.m, self.back = app, model, back
         self.ref = reference
-        self.play_original = reference is not None
+        self.parts = parts or []
+        self.part_i = part
+        self.tracks_row = any(p.track.pcm is not None for p in self.parts)  # песню разделила нейросеть
+        self.top = TOOL_H + (TRACKS_H if self.tracks_row else 0)   # где начинается сетка
+        self.sound = "off" if reference is None else "minus" if self.tracks_row else "song"
         self.ref_channel = None
         self.ref_sound = None
         if reference is not None and pygame.mixer.get_init():
             pygame.mixer.set_reserved(1)  # канал 0 — только для песни, синтезатор его не займёт
             self.ref_channel = pygame.mixer.Channel(0)
+        if self.parts:
+            self.m = self.parts[part].model
+            self._follow_part()
         self.zoom_i = 3
         self.drag: dict | None = None
         self.scrub: tuple[int, float] | None = None
@@ -105,13 +158,11 @@ class EditorScreen:
         k = math.floor((x - D.X0) / D.SLOT)
         return LOW + k if 0 <= k <= HIGH - LOW else None
 
-    @staticmethod
-    def in_grid(pos) -> bool:
-        return D.X0 <= pos[0] < GRID_X1 and AREA_TOP <= pos[1] < AREA_BOTTOM
+    def in_grid(self, pos) -> bool:
+        return D.X0 <= pos[0] < GRID_X1 and self.top <= pos[1] < AREA_BOTTOM
 
-    @staticmethod
-    def in_ruler(pos) -> bool:
-        return pos[0] < D.X0 and AREA_TOP <= pos[1] < AREA_BOTTOM
+    def in_ruler(self, pos) -> bool:
+        return pos[0] < D.X0 and self.top <= pos[1] < AREA_BOTTOM
 
     # --- действия ---
 
@@ -180,12 +231,18 @@ class EditorScreen:
         copy = " как своя копия" if was is not None and was != path else ""
         self.app.notify(f"Сохранено{copy}: «{self.m.title}» — её можно учить в «Учить мелодию»")
 
+    @property
+    def dirty(self) -> bool:
+        """Есть несохранённое — в этой дорожке или в любой другой дорожке песни."""
+        return any(p.model.dirty for p in self.parts) if self.parts else self.m.dirty
+
     def can_leave(self) -> bool:
         """С несохранёнными изменениями выходим со второго раза — первый только предупреждает."""
-        if not self.m.dirty or (self.exit_armed is not None and self.app.now - self.exit_armed < 4):
+        if not self.dirty or (self.exit_armed is not None and self.app.now - self.exit_armed < 4):
             return True
         self.exit_armed = self.app.now
-        self.app.notify("Есть несохранённые изменения: Ctrl/Cmd+S — сохранить, ещё раз — выйти без сохранения",
+        what = "изменения" if self.m.dirty or not self.parts else "дорожки"
+        self.app.notify(f"Есть несохранённые {what}: Ctrl/Cmd+S — сохранить, ещё раз — выйти без сохранения",
                         error=True)
         return False
 
@@ -212,22 +269,46 @@ class EditorScreen:
             self._stop_original()
             self.app.open_library()
 
-    # --- «Оригинал» ---
+    # --- дорожки песни ---
+
+    def _follow_part(self) -> None:
+        """Песня и волна — под выбранную дорожку: у каждой своя доля 0."""
+        part = self.parts[self.part_i]
+        if self.ref is not None:
+            self.ref.start, self.ref.track = part.start, part.track
+
+    def select_part(self, i: int) -> None:
+        if not 0 <= i < len(self.parts) or i == self.part_i:
+            return
+        self.end_title()
+        self.m.stop()
+        self.app.play_events(self.m.pop_events())
+        self._stop_original()
+        self.drag = self.scrub = None
+        self.part_i = i
+        self.m = self.parts[i].model
+        self._follow_part()
+        self.app.notify(f"Дорожка «{self.parts[i].track.name}»: "
+                        f"{D.plural(len(self.m.notes), ('нота', 'ноты', 'нот'))}  ·  Пробел — играть")
+
+    # --- «Оригинал» и «Звук» ---
 
     def toggle_original(self) -> None:
-        self.play_original = not self.play_original
-        if not self.play_original:
-            self._stop_original()
-        elif self.m.playing:
+        self.set_sound("off" if self.sound != "off" else "song")
+
+    def set_sound(self, mode: str) -> None:
+        self.sound = mode
+        self._stop_original()
+        if mode != "off" and self.m.playing:
             self._start_original(self.m.playhead)
 
     def _start_original(self, beat: float) -> None:
-        if self.ref is None or self.ref_channel is None or not self.play_original:
+        if self.ref is None or self.ref_channel is None or self.sound == "off":
             return
         spb = 60.0 / self.m.bpm
         start = self.ref.start + beat * spb
         end = self.ref.start + (self.m.length_beats() + 2 * BEATS_PER_BAR) * spb
-        part = self.ref.audio.segment(start, max(end, start + 1))
+        part = self.ref.sound(self.sound, start, max(end, start + 1))
         if len(part) == 0:
             return
         self.ref_sound = pygame.sndarray.make_sound(part)
@@ -352,6 +433,8 @@ class EditorScreen:
                 m.selected = set(m.notes)
             elif sc == pygame.KSCAN_U:
                 self.align()
+            elif sc in DIGITS:
+                self.select_part(DIGITS.index(sc))
             else:
                 return False
             return True
@@ -594,26 +677,63 @@ class EditorScreen:
         x = self._chip(x, "Выровнять", self.align)
         x = self._chip(x, "Метроном", lambda: self.cycle("metronome"), m.metronome)
         x = self._chip(x, "Ввод клавишами", lambda: self.cycle("step"), m.step_input)
-        if self.ref is not None:
-            self._chip(x, "Оригинал", self.toggle_original, self.play_original)
+        if self.ref is not None and not self.tracks_row:
+            self._chip(x, "Оригинал", self.toggle_original, self.sound != "off")
+        if self.tracks_row:
+            self.draw_tracks(s)
+
+    def draw_tracks(self, s) -> None:
+        """Третья строка: вкладки дорожек, как в Songsterr, и что звучит вместе с нотами."""
+        top = TOOL_H
+        D.rect(s, (20, 22, 27), (0, top, D.W, TRACKS_H))
+        D.line(s, D.LINE, (0, top + TRACKS_H - 1), (D.W, top + TRACKS_H - 1))
+        cy = top + TRACKS_H // 2 - 1
+        D.text(s, "Дорожка", 14, D.MUTED, midleft=(16, cy))
+        x = 90
+        for i, part in enumerate(self.parts):
+            key, name = part.track.key, part.track.name
+            sel = i == self.part_i
+            w = 40 + D.measure(name, 14, True)[0] + 14
+            tab = pygame.Rect(x, top + 4, w, TRACKS_H - 10)
+            D.rect(s, D.PANEL_HI if sel else D.PANEL, tab, border_radius=8)
+            color = COLORS.get(key, D.TEXT)
+            if sel:
+                D.rect(s, color, (tab.left + 8, tab.bottom - 3, tab.width - 16, 3), border_radius=2)
+            D.circle(s, color if sel else D.mix(color, D.PANEL, 0.4), (tab.left + 17, tab.centery), 11)
+            draw_icon(s, key, (tab.left + 17, tab.centery), 15, D.DARK_TEXT)
+            D.text(s, name, 14, D.TEXT if sel else D.MUTED, bold=sel, midleft=(tab.left + 34, tab.centery))
+            self.app.zones.append((tab, lambda i=i: self.select_part(i)))
+            x = tab.right + 6
+
+        right = D.W - 16
+        for mode in reversed(SOUND):
+            label = SOUND[mode]
+            w = D.measure(label, 14, True)[0] + 22
+            seg = pygame.Rect(right - w, top + 4, w, TRACKS_H - 10)
+            on = self.sound == mode
+            D.rect(s, D.TEXT if on else D.PANEL, seg, border_radius=8)
+            D.text(s, label, 14, D.DARK_TEXT if on else D.MUTED, bold=on, center=seg.center)
+            self.app.zones.append((seg, lambda mode=mode: self.set_sound(mode)))
+            right = seg.left - 4
+        D.text(s, "Звук", 14, D.MUTED, midright=(right - 8, cy))
 
     def draw_grid(self, s) -> None:
-        m = self.m
-        D.draw_lanes(s, AREA_TOP, AREA_BOTTOM)
-        s.fill((20, 22, 27), (0, AREA_TOP, D.X0 - 2, AREA_BOTTOM - AREA_TOP))  # линейка
-        if self.ref is not None:  # волна песни вдоль времени — видно, где мелодия и где пауза
-            spb, env, k = 60.0 / m.bpm, self.ref.audio.env, s.scale
+        m, top = self.m, self.top
+        D.draw_lanes(s, top, AREA_BOTTOM)
+        s.fill((20, 22, 27), (0, top, D.X0 - 2, AREA_BOTTOM - top))  # линейка
+        if self.ref is not None:  # волна песни (или дорожки) вдоль времени — видно, где мелодия и где пауза
+            (env, origin), spb, k = self.ref.envelope(), 60.0 / m.bpm, s.scale
             right, room = s.px(D.X0 - 3), (D.X0 - 6) * k
-            for py in range(s.px(AREA_TOP), s.px(AREA_BOTTOM)):  # по пикселю экрана — чёткая и на Retina
-                i = int((self.ref.start + self.t_of(py / k) * spb) * 100)
+            for py in range(s.px(top), s.px(AREA_BOTTOM)):  # по пикселю экрана — чёткая и на Retina
+                i = int((self.ref.start - origin + self.t_of(py / k) * spb) * 100)
                 if 0 <= i < len(env) and env[i] > 0.02:
                     pygame.draw.line(s.surface, WAVE, (right - round(env[i] * room), py), (right, py))
-        s.set_clip(pygame.Rect(0, AREA_TOP, D.W, AREA_BOTTOM - AREA_TOP))
+        s.set_clip(pygame.Rect(0, top, D.W, AREA_BOTTOM - top))
         y0 = self.y_of(0.0)
         if y0 < AREA_BOTTOM:  # до начала мелодии
-            s.fill((8, 9, 11), (D.X0, max(AREA_TOP, y0), GRID_X1 - D.X0, AREA_BOTTOM))
+            s.fill((8, 9, 11), (D.X0, max(top, y0), GRID_X1 - D.X0, AREA_BOTTOM))
 
-        t_lo, t_hi = max(0.0, self.t_of(AREA_BOTTOM)), self.t_of(AREA_TOP)
+        t_lo, t_hi = max(0.0, self.t_of(AREA_BOTTOM)), self.t_of(top)
         step = m.grid
         for k in range(math.ceil(t_lo / step - EPS), math.floor(t_hi / step + EPS) + 1):
             t = k * step
@@ -634,7 +754,7 @@ class EditorScreen:
 
         for x in m.notes:
             yb, yt = self.y_of(x.t), self.y_of(x.end)
-            if yt > AREA_BOTTOM or yb < AREA_TOP:
+            if yt > AREA_BOTTOM or yb < top:
                 continue
             rect = D.lane_rect(x.n, yt + 1, yb - 1)
             fill = note_color(x.n)
@@ -661,7 +781,7 @@ class EditorScreen:
         D.line(s, color, (D.X0 - 8, PLAY_Y), (GRID_X1, PLAY_Y), 2)
         D.polygon(s, color, [(2, PLAY_Y - 7), (13, PLAY_Y), (2, PLAY_Y + 7)])
 
-        mid = (D.W // 2, (AREA_TOP + PLAY_Y) // 2)
+        mid = (D.W // 2, (top + PLAY_Y) // 2)
         if m.recording and m.playhead < m.record_from:
             left = m.record_from - m.playhead
             D.text(s, str(math.ceil(left)), 110, REC, bold=True, alpha=round(80 + 175 * (left % 1)), center=mid)
@@ -673,8 +793,9 @@ class EditorScreen:
                 D.text(s, line, 18 if i < 2 else 15, D.TEXT if i < 2 else D.MUTED, center=(mid[0], mid[1] - 30 + i * 30))
 
     def draw_help(self, s) -> None:
-        panel = pygame.Rect(0, 0, 940, 20 + 17 * len(HELP))
-        panel.center = (D.W // 2, (AREA_TOP + AREA_BOTTOM) // 2)
+        line = 16
+        panel = pygame.Rect(0, 0, 940, 20 + line * len(HELP))
+        panel.center = (D.W // 2, (TOOL_H + AREA_BOTTOM) // 2)
         D.shade(s, (0, 0, D.W, AREA_BOTTOM), (6, 7, 9, 190))
         D.rect(s, D.PANEL, panel, border_radius=12)
         y = panel.top + 10
@@ -684,4 +805,4 @@ class EditorScreen:
             else:
                 D.text(s, keys, 13, D.TEXT, bold=True, topleft=(panel.left + 28, y))
                 D.text(s, desc, 13, D.TEXT, topleft=(panel.left + 260, y))
-            y += 17
+            y += line

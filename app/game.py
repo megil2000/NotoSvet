@@ -20,9 +20,10 @@ from . import paths, records, settings
 from .audio import AUDIO_EXT
 from .converter import import_file
 from .display import Display
-from .editor import EditorModel
-from .editor_view import EditorScreen, Reference
+from .editor import GRIDS, EditorModel, ENote
+from .editor_view import EditorScreen, Part, Reference
 from .import_view import FragmentScreen, LibraryScreen
+from .tracks_view import TracksScreen
 from .config import HIGH, LOW, NOTE_LABEL, SCAN_TO_NOTE, note_color, note_name
 from .menu_view import draw_menu
 from .icon import make_icon
@@ -93,6 +94,7 @@ class App:
         self.editor: EditorScreen | None = None
         self.library: LibraryScreen | None = None
         self.fragment: FragmentScreen | None = None
+        self.tracks: TracksScreen | None = None
         self.running = True
 
     @property
@@ -174,7 +176,8 @@ class App:
     # --- ввод ---
 
     def active_screen(self):
-        return {"editor": self.editor, "library": self.library, "fragment": self.fragment}.get(self.state)
+        return {"editor": self.editor, "library": self.library, "fragment": self.fragment,
+                "tracks": self.tracks}.get(self.state)
 
     def mouse_pos(self) -> tuple[int, int]:
         return self.display.mouse_pos() if self.display is not None else pygame.mouse.get_pos()
@@ -331,9 +334,11 @@ class App:
             return
         self.reload_lessons(select=target)
         if self.state == "editor":
-            if not self.editor.m.dirty:  # пустой или сохранённый редактор — открываем мелодию в нём
+            if not self.editor.dirty:  # пустой или сохранённый редактор — открываем мелодию в нём
                 self.open_editor(self.lesson, self.editor.back)
         elif self.state != "play":
+            if self.tracks is not None:
+                self.tracks.close()  # дорожка, которую слушали, замолкает
             self.state = "setup"
         self.notify(f"Мелодия «{self.lesson.title}» добавлена — {plural(len(self.lesson.notes), ('нота', 'ноты', 'нот'))}")
 
@@ -392,11 +397,15 @@ class App:
             return
         if self.state == "editor" and not self.editor.can_leave():
             return  # несохранённая мелодия: сначала предупреждаем, со второго раза — продолжаем
+        back = self.fragment.back if self.state == "tracks" and self.fragment else self.state
+        if self.tracks is not None:
+            self.tracks.close()
+            self.tracks = None
         if self.fragment is not None:
             self.fragment.close()
         if self.state == "library":
             pygame.key.stop_text_input()
-        back = self.state if self.state in ("library", "editor", "menu", "setup") else "menu"
+        back = back if back in ("library", "editor", "menu", "setup") else "menu"
         self.toast = None
         self.fragment = FragmentScreen(self, path, back)
         self.state = "fragment"
@@ -410,24 +419,66 @@ class App:
         elif back == "editor" and self.editor is None:
             self.state = "menu"
 
-    def finish_import(self, model: EditorModel, reference: Reference, result) -> None:
-        """Мелодия распознана — открываем её в редакторе вместе с песней."""
+    def open_tracks(self, rec, audio, start: float) -> None:
+        """Нейросеть разделила песню — показываем дорожки, как в Songsterr."""
+        self.release_keys()
+        self.toast = None
+        self.tracks = TracksScreen(self, rec, audio, start)
+        self.state = "tracks"
+
+    def close_tracks(self) -> None:
+        """Назад к фрагменту: можно выделить другой кусок или распознать заново."""
+        self.tracks = None
+        self.state = "fragment" if self.fragment is not None else "menu"
+
+    def play_track(self, index: int) -> None:
+        t = self.tracks
+        if t is not None:
+            self.finish_import(t.rec, t.audio, t.start, index)
+
+    def finish_import(self, rec, audio, start: float, index: int) -> None:
+        """Песня распознана — открываем дорожку index в редакторе вместе с песней.
+
+        Остальные дорожки с нотами — вкладки редактора: у каждой свои ноты и своя отмена.
+        """
         back = self.fragment.back if self.fragment else "menu"
         if self.library is not None:
             self.library.close()
             self.library = None
-        self.fragment = None
+        if self.fragment is not None:
+            self.fragment.close()
+            self.fragment = None
+        if self.tracks is not None:
+            self.tracks.close()
+            self.tracks = None
         if self.editor is not None:
             back = self.editor.back
             self.editor.close()
         elif back not in ("menu", "setup"):
             back = "menu"
         self.release_keys()
-        self.editor = EditorScreen(self, model, back, reference)
+        grid_i = next((i for i, (g, _) in enumerate(GRIDS) if abs(g - rec.grid) < 1e-9), 1)
+        parts, current = [], 0
+        for k, track in enumerate(rec.tracks):
+            if not track.playable:
+                continue
+            title = f"{audio.title} — {track.name}" if rec.neural else audio.title
+            model = EditorModel(title, rec.bpm, [ENote(*x) for x in track.notes])
+            model.grid_i, model.dirty = grid_i, True
+            if k == index:
+                current = len(parts)
+            parts.append(Part(track, model, start + track.start))
+        reference = Reference(audio, parts[current].start, offset=rec.offset)
+        self.editor = EditorScreen(self, parts[current].model, back, reference, parts, current)
         self.state = "editor"
-        hint = " Кажется вдвое быстрее? «÷2»." if result.bpm >= 120 else ""
-        self.notify(f"Распознано {plural(len(model.notes), ('нота', 'ноты', 'нот'))}, темп {result.bpm:g} уд/мин. "
-                    f"Послушайте с «Оригиналом» и поправьте ноты.{hint}")
+        hint = " Кажется вдвое быстрее? «÷2»." if rec.bpm >= 120 else ""
+        notes = plural(len(parts[current].model.notes), ("нота", "ноты", "нот"))
+        if rec.neural:
+            self.notify(f"«{parts[current].track.name}»: {notes}, темп {rec.bpm:g} уд/мин. "
+                        f"Звук «Минус» — остальные дорожки играют вместе с нотами.{hint}")
+        else:
+            self.notify(f"Распознано {notes}, темп {rec.bpm:g} уд/мин. "
+                        f"Послушайте с «Оригиналом» и поправьте ноты.{hint}")
 
     def open_folder(self) -> None:
         folder = paths.USER_LESSONS
@@ -582,6 +633,9 @@ class App:
 
     def draw_fragment(self) -> None:
         self.fragment.draw()
+
+    def draw_tracks(self) -> None:
+        self.tracks.draw()
 
     def draw_menu(self) -> None:
         draw_menu(self)

@@ -1,13 +1,18 @@
-"""Сборка готовой программы: python build.py
+"""Сборка готовой программы: python build.py [--no-ai]
 
   macOS   → dist/NotoSvet.app и dist/NotoSvet-macOS.zip (чтобы переслать)
-  Windows → dist/NotoSvet.exe — один файл
+  Windows → dist/NotoSvet.exe — один файл; с нейросетями — папка dist/NotoSvet и NotoSvet-Windows.zip
+
+Если в окружении сборки есть PyTorch и Demucs (requirements-ai.txt), нейросети встраиваются
+в программу вместе с весами Demucs из .model-cache — программа станет ~600 МБ, зато
+разделяет песни на дорожки без интернета. --no-ai — маленькая сборка со старым распознаванием.
 
 Собирать нужно на той системе, для которой программа: PyInstaller не собирает
 Windows-версию на Mac и наоборот. Нужен PyInstaller: pip install pyinstaller
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 import os
 import shutil
@@ -22,6 +27,9 @@ DIST = ROOT / "dist"
 NAME = "NotoSvet"
 MAC = sys.platform == "darwin"
 WINDOWS = os.name == "nt"
+DEMUCS_WEIGHTS = ROOT / ".model-cache" / "checkpoints" / "5c90dfd2-34c22ccb.th"
+AI_MODULES = ("torch", "torchaudio", "demucs", "dora", "openunmix", "julius", "einops", "omegaconf",
+              "lameenc", "huggingface_hub", "safetensors", "sphn")
 
 
 def icon_png(size: int) -> bytes:
@@ -70,24 +78,40 @@ def main() -> int:
     icon = BUILD / (f"{NAME}.icns" if MAC else f"{NAME}.ico")
     make_icns(icon) if MAC else make_ico(icon)
 
+    ai = "--no-ai" not in sys.argv and all(importlib.util.find_spec(m) for m in ("torch", "demucs"))
     args = [sys.executable, "-m", "PyInstaller", str(ROOT / "main.py"),
             "--name", NAME, "--windowed", "--noconfirm", "--log-level", "WARN",
             "--distpath", str(DIST), "--workpath", str(BUILD / "work"), "--specpath", str(BUILD),
             "--icon", str(icon),
             "--add-data", f"{ROOT / 'lessons'}{os.pathsep}lessons",
+            "--add-data", f"{ROOT / 'app' / 'models'}{os.pathsep}app/models",   # веса Basic Pitch
             "--hidden-import", "mido.backends.rtmidi",  # mido грузит бэкенд по имени — сам PyInstaller его не видит
             "--exclude-module", "tkinter"]
+    if ai:
+        args += ["--collect-submodules", "demucs"]  # класс модели берётся из файла весов по имени
+        if DEMUCS_WEIGHTS.exists():
+            args += ["--add-data", f"{DEMUCS_WEIGHTS}{os.pathsep}models"]
+        print("Нейросети встраиваются" + ("" if DEMUCS_WEIGHTS.exists() else
+                                          " (веса Demucs скачаются при первом распознавании)"))
+    else:
+        for module in AI_MODULES:
+            args += ["--exclude-module", module]
+        print("Сборка без нейросетей: «Мелодия из песни» — старым способом")
+    one_file = not MAC and not ai  # с PyTorch один файл распаковывал бы ~1 ГБ при каждом запуске
     if MAC:
         args += ["--osx-bundle-identifier", "ru.notosvet.app"]
-    else:
+    elif one_file:
         args += ["--onefile"]
     subprocess.run(args, check=True, cwd=ROOT)
 
     if MAC:
         app = DIST / f"{NAME}.app"
         exe = app / "Contents" / "MacOS" / NAME
-    else:
+    elif one_file:
         app = exe = DIST / (f"{NAME}.exe" if WINDOWS else NAME)
+    else:
+        app = DIST / NAME
+        exe = app / (f"{NAME}.exe" if WINDOWS else NAME)
 
     print("\nСамопроверка собранной программы:")
     check = subprocess.run([str(exe), "--selftest"])
@@ -98,6 +122,10 @@ def main() -> int:
     if MAC:  # ditto сохраняет подпись и ссылки внутри .app
         archive = DIST / f"{NAME}-macOS.zip"
         subprocess.run(["ditto", "-c", "-k", "--keepParent", str(app), str(archive)], check=True)
+        print(f"\nГотово: {app.relative_to(ROOT)} и {archive.relative_to(ROOT)}")
+    elif not one_file:  # папку пересылают архивом
+        archive = Path(shutil.make_archive(str(DIST / f"{NAME}-{'Windows' if WINDOWS else 'Linux'}"), "zip",
+                                           DIST, NAME))
         print(f"\nГотово: {app.relative_to(ROOT)} и {archive.relative_to(ROOT)}")
     else:
         print(f"\nГотово: {app.relative_to(ROOT)}")

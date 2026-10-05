@@ -90,6 +90,7 @@ def selftest() -> int:
         checks.append(("мелодия из песни", pitches == scale and r.bpm == 120, f"{len(pitches)} нот, {r.bpm:g} уд/мин"))
     except Exception as e:  # noqa: BLE001 — в отчёт любую причину
         checks.append(("мелодия из песни", False, repr(e)))
+    checks += neural_checks(np.float32(0.3) * x.astype(np.float32) / np.abs(x).max(), scale)
 
     app.start_session()  # первый урок в режиме «Ожидание», играем без ошибок
     for _ in range(60 * 120):
@@ -113,3 +114,35 @@ def selftest() -> int:
         print(f"{'OK  ' if passed else 'FAIL'} {name} {info}")
     pygame.quit()
     return 0 if all(passed for _, passed, _ in checks) else 1
+
+
+def neural_checks(x, scale: list[int]) -> list[tuple[str, bool, str]]:
+    """Нейросети, если они есть: Basic Pitch слышит гамму, Demucs делит звук на дорожки.
+    Без PyTorch это не ошибка — песни распознаются старым способом."""
+    import numpy as np
+
+    from . import neural
+    if not neural.available():
+        return [("нейросети", True, "не установлены — «Мелодия из песни» работает старым способом")]
+    out = []
+    try:
+        import torch
+
+        from . import basic_pitch as BP
+        note, onset, _ = BP.predict(x)
+        pitches = [p for _, _, p, _ in neural.melody_notes(note, onset, 40, 88)]
+        out.append(("нейросеть Basic Pitch", pitches == scale, f"{len(pitches)} нот, PyTorch {torch.__version__}"))
+    except Exception as e:  # noqa: BLE001 — в отчёт любую причину
+        out.append(("нейросеть Basic Pitch", False, repr(e)))
+    try:
+        from . import separate as S
+        if S.weights_path() is None:
+            out.append(("нейросеть Demucs", True, "веса скачаются при первом распознавании"))
+        else:
+            stereo = np.repeat(x[:2 * 22050, None], 2, axis=1).repeat(2, axis=0)  # 2 с, 44 100 Гц
+            stems = S.separate(stereo)
+            ok = sorted(stems) == sorted(S.SOURCES) and all(v.shape == stereo.shape for v in stems.values())
+            out.append(("нейросеть Demucs", ok, f"{len(stems)} дорожек"))
+    except Exception as e:  # noqa: BLE001
+        out.append(("нейросеть Demucs", False, repr(e)))
+    return out

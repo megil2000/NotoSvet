@@ -4,6 +4,10 @@
 В собранной программе встроенные уроки лежат внутри неё (только чтение), а результаты
 и свои мелодии — в папке пользователя: на macOS ~/Library/Application Support/NotoSvet,
 на Windows %APPDATA%\\NotoSvet.
+
+Веса нейросетей: маленькая Basic Pitch лежит в app/models, большая Demucs (53 МБ) скачивается
+при первом распознавании в .model-cache/ (из исходников) или в папку пользователя,
+а в собранную программу её можно встроить — тогда она в BUNDLE/models.
 """
 from __future__ import annotations
 
@@ -30,3 +34,6 @@ USER_LESSONS = DATA_DIR / "lessons"  # из исходников совпада�
 RECORDS = DATA_DIR / "records.json"
 SETTINGS = DATA_DIR / "settings.json"
 ERROR_LOG = DATA_DIR / "error.log"
+NET_WEIGHTS = BUNDLE / "app" / "models"                                           # Basic Pitch
+MODELS = DATA_DIR / "models" if FROZEN else ROOT / ".model-cache" / "checkpoints"  # Demucs: сюда скачивается
+BUILTIN_MODELS = BUNDLE / "models"                                                 # Demucs, встроенная в сборку
